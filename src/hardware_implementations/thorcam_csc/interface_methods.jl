@@ -91,7 +91,8 @@ end
 
 function CameraInterface.abort(camera::ThorCamCSCCamera)
     #Shutdown Camera
-    shutdown(camera)
+    #shutdown(camera)
+    disarmcamera(camera)
 end
 
 function CameraInterface.getdata(camera::ThorCamCSCCamera)
