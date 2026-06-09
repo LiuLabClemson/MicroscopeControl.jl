@@ -1,7 +1,7 @@
-function loadlut()  #TODO: Input LUT path
+function loadlut(lut_path)  #TODO: Input LUT path
     #This works, now must load the LUT
-    lut_path = "C:\\Program Files\\Meadowlark Optics\\Blink OverDrive Plus\\LUT Files\\1024x1024_linearVoltage.LUT"
-    loaded_lut = @ccall "C:\\Program Files\\Meadowlark Optics\\Blink OverDrive Plus\\SDK\\Blink_C_wrapper.dll".Load_LUT_file(1::Cuint, lut_path::Ptr{UInt8})::Cint
+    #lut_path = "C:\\Program Files\\Meadowlark Optics\\Blink OverDrive Plus\\LUT Files\\1024x1024_linearVoltage.LUT"
+    loaded_lut = @ccall blink_sdk_path.Load_LUT_file(1::Cuint, lut_path::Ptr{UInt8})::Cint
 
 end
 
@@ -24,9 +24,13 @@ function writesingleimage(slm::MLSLM)
     new_image[:] .= single_image[1, :]
     =#
     new_image = reshape(single_image, image_size)
-    @ccall "C:\\Program Files\\Meadowlark Optics\\Blink OverDrive Plus\\SDK\\Blink_C_wrapper.dll".Write_image(board_number::Cuint, 
-        new_image::Ptr{Cint}, image_size::Cint, wait_for_trigger::Cuint, flip_immediate::Cuint, output_pulse_image_flip::Cuint, 
-        output_pulse_image_refresh::Cuint, trigger_timout_ms::Cuint)::Cint
+    #@ccall blink_sdk_path.Write_image(board_number::Cuint, 
+    #    new_image::Ptr{Cint}, image_size::Cint, wait_for_trigger::Cuint, flip_immediate::Cuint, output_pulse_image_flip::Cuint, 
+    #    output_pulse_image_refresh::Cuint, trigger_timout_ms::Cuint)::Cint
+
+    @ccall blink_sdk_path.Write_image(board_number::Cuint, 
+        new_image::Ptr{Cint}, trigger_timout_ms::Cuint)::Cint
+
     
 end
 
