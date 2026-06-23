@@ -5,6 +5,7 @@ function loadlut(lut_path)  #TODO: Input LUT path
 
 end
 
+#=
 function writesingleimage(slm::MLSLM)
     single_image = slm.phase .* 255 #Converting 0 to 1 to scaled values between 0 and 255
     single_image = round.(Int, single_image) #Converting to integers
@@ -28,10 +29,37 @@ function writesingleimage(slm::MLSLM)
     #    new_image::Ptr{Cint}, image_size::Cint, wait_for_trigger::Cuint, flip_immediate::Cuint, output_pulse_image_flip::Cuint, 
     #    output_pulse_image_refresh::Cuint, trigger_timout_ms::Cuint)::Cint
 
-    @ccall blink_sdk_path.Write_image(board_number::Cuint, 
-        new_image::Ptr{Cint}, trigger_timout_ms::Cuint)::Cint
+
+    #this here is og code
+    #@ccall blink_sdk_path.Write_image(board_number::Cuint, 
+    #    new_image::Ptr{Cint}, trigger_timout_ms::Cuint)::Cint
+    @ccall blink_sdk_path.Write_image(board_number::Cuint,
+        new_image::Ptr{Cuchar}, trigger_timout_ms::Cuint)::Cint
+    
 
     
+end 
+=#
+function writesingleimage(slm::MLSLM; board_number::Integer=1, trigger_timeout_ms::Integer=5000)
+    single_image = slm.phase .* 255
+    single_image = round.(UInt8, clamp.(single_image, 0, 255))  # clamp before cast, see note below
+    image_size = slm.height * slm.width
+    new_image = reshape(single_image, image_size)
+
+    result = @ccall blink_sdk_path.Write_image(
+        board_number::Cint,
+        new_image::Ptr{Cuchar},
+        trigger_timeout_ms::Cuint
+    )::Cint
+
+    if result != 1
+        error("Write_image failed (board=$board_number). SDK returned $result.")
+    end
+
+    # Block until hardware is actually ready for the next DMA / actually displaying this image
+    imagewritecomplete(slm; board_number=board_number, trigger_timeout_ms=trigger_timeout_ms)
+
+    return result
 end
 
 function writesequence(slm::MLSLM)
@@ -40,4 +68,16 @@ end
 
 function selectsequenceimage(slm::MLSLM)
     @error "Not implemented"
+end
+
+function imagewritecomplete(slm::MLSLM; board_number::Integer=1, trigger_timeout_ms::Integer=5000)
+    result = @ccall blink_sdk_path.ImageWriteComplete(
+        board_number::Cint,
+        trigger_timeout_ms::Cuint
+    )::Cint
+
+    if result != 1
+        error("ImageWriteComplete failed (board=$board_number). SDK returned $result.")
+    end
+    return result
 end
