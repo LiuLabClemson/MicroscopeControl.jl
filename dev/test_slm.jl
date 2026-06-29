@@ -8,12 +8,11 @@ using MicroscopeControl.HardwareImplementations.Meadowlark # for the SLM
 using OpenCV
 const cv = OpenCV
 
-#for testing purposes
 using CairoMakie
 CM = CairoMakie
 using Statistics
 using JLD2
-
+using Dates 
 
 
 #Constants
@@ -764,7 +763,7 @@ display(fig)
 
 
 # ==============================================================================
-#8. Fit parabola to 5 extremea
+#8. Fit parabola to 5 extremea 
 # Fig 2.a
 # ==============================================================================
 
@@ -989,7 +988,6 @@ display(fig)
 #More diagonitic figures, dont normallly run this time for diffraction limit
 #not working....
 # This is for the diffraction test, not working yet. 
-
 
 
 best_idx = sortperm(errors)[1:10]
@@ -1220,6 +1218,138 @@ peak_idx = argmax(spot_img_rem)
 println("True peak row (y) and col (x): ", peak_idx)
 
 
+#claude way to visulize diffraction test
+# ── Improved ROI extraction and centering ─────────────────────────────────
+
+window = 8   # extract a larger initial window for centroid finding
+
+rois_centered = Matrix{Float64}[]
+true_centers  = Tuple{Float64,Float64}[]   # (col, row) in full image coords
+predicted_centers_rc = Tuple{Int,Int}[]    # (row, col) from affine
+
+for (xc, yc) in predicted_centers
+    # xc = predicted column, yc = predicted row (from your affine convention)
+    pred_col = round(Int, xc)
+    pred_row = round(Int, yc)
+
+    push!(predicted_centers_rc, (pred_row, pred_col))
+
+    # Extract generous window around predicted center
+    r0 = clamp(pred_row - window, 1, size(spot_img_rem, 1))
+    r1 = clamp(pred_row + window, 1, size(spot_img_rem, 1))
+    c0 = clamp(pred_col - window, 1, size(spot_img_rem, 2))
+    c1 = clamp(pred_col + window, 1, size(spot_img_rem, 2))
+
+    big_roi = spot_img_rem[r0:r1, c0:c1]
+
+    # ── Centroid refinement: find the true center within this window ──────
+    # Use intensity-weighted centroid (center of mass), which is more robust
+    # than argmax for noisy PSFs and gives sub-pixel accuracy
+    total_intensity = sum(big_roi)
+
+    if total_intensity < 1e-6
+        # Degenerate: no signal, keep affine prediction as fallback
+        push!(true_centers, (Float64(pred_col), Float64(pred_row)))
+        # Still extract a small centered ROI
+        small_half = 5
+        rs = clamp(pred_row - small_half, 1, size(spot_img_rem, 1))
+        re = clamp(pred_row + small_half, 1, size(spot_img_rem, 1))
+        cs = clamp(pred_col - small_half, 1, size(spot_img_rem, 2))
+        ce = clamp(pred_col + small_half, 1, size(spot_img_rem, 2))
+        push!(rois_centered, spot_img_rem[rs:re, cs:ce])
+        continue
+    end
+
+    # Weighted centroid in ROI-local coordinates (1-based)
+    rows_roi = r0:r1
+    cols_roi = c0:c1
+
+    centroid_row = 0.0
+    centroid_col = 0.0
+    for (ri, r) in enumerate(rows_roi)
+        for (ci, c) in enumerate(cols_roi)
+            w = max(0.0, spot_img_rem[r, c])
+            centroid_row += w * r
+            centroid_col += w * c
+        end
+    end
+    centroid_row /= total_intensity
+    centroid_col /= total_intensity
+
+    push!(true_centers, (centroid_col, centroid_row))  # (col, row) convention
+
+    # ── Re-extract a tightly centered ROI around the TRUE centroid ────────
+    small_half = 5
+    tc_row = round(Int, centroid_row)
+    tc_col = round(Int, centroid_col)
+
+    rs = clamp(tc_row - small_half, 1, size(spot_img_rem, 1))
+    re = clamp(tc_row + small_half, 1, size(spot_img_rem, 1))
+    cs = clamp(tc_col - small_half, 1, size(spot_img_rem, 2))
+    ce = clamp(tc_col + small_half, 1, size(spot_img_rem, 2))
+
+    push!(rois_centered, spot_img_rem[rs:re, cs:ce])
+end
+
+# ── Print: predicted vs true center for each spot ─────────────────────────
+println("\nAffine prediction vs centroid-refined true center:")
+println("  Spot  |  pred(row,col)  |  true(row,col)  |  offset(row,col)")
+for i in eachindex(predicted_centers)
+    pr, pc = predicted_centers_rc[i]
+    tc, tr = true_centers[i]   # (col, row) stored above
+    tr_i = round(tr, digits=1)
+    tc_i = round(tc, digits=1)
+    Δr = tr_i - pr
+    Δc = tc_i - pc
+    println("  $i     |  ($pr, $pc)     |  ($tr_i, $tc_i)    |  ($Δr, $Δc)")
+end
+
+# ── Visualization: spots now properly centered ─────────────────────────────
+fig = Figure(size=(1200, 600))
+for i in eachindex(rois_centered)
+    row_panel = ceil(Int, i / 5)
+    col_panel = mod1(i, 5)
+
+    ax = CM.Axis(fig[row_panel, col_panel],
+                  title = "Spot $i",
+                  aspect = DataAspect())
+
+    # Do NOT transpose here — the ROI is already [row, col] and
+    # we want row on the vertical axis (y) increasing downward
+    # which is standard image convention. heatmap maps dim1→x, dim2→y
+    # so we DO need the transpose to show it as an image:
+    heatmap!(ax, rois_centered[i]',
+             colormap = :inferno)
+end
+display(fig)
+
+# ── Full image overlay: predicted (cyan) vs true centroid (yellow) ─────────
+fig2 = Figure(size=(900, 700))
+ax2 = CM.Axis(fig2[1,1],
+               yreversed = true,
+               title = "Diffraction test: predicted (cyan) vs true centroid (yellow)")
+heatmap!(ax2, spot_img_rem')
+
+# Predicted centers from affine
+scatter!(ax2,
+         [p[1] for p in predicted_centers],   # xc = col
+         [p[2] for p in predicted_centers],   # yc = row
+         color = :cyan, markersize = 14,
+         strokecolor = :black, strokewidth = 1,
+         label = "affine prediction")
+
+# True centroid centers
+scatter!(ax2,
+         [p[1] for p in true_centers],    # col
+         [p[2] for p in true_centers],    # row
+         color = :yellow, markersize = 10,
+         marker = :cross, strokewidth = 2,
+         label = "centroid refined")
+
+axislegend(ax2)
+display(fig2)
+
+
 
 # ==============================================================================
 #9. Split the 256-step curve into 4 distinct voltage intervals separated by these calculated extrema positions. 
@@ -1260,7 +1390,9 @@ for xi in 1:Nx
         
         # 1. Generate the smoothed profile for segment extraction
         raw_profile = intensity_cube[xi, yi, :]
-        smoothed_profile = smooth_profile(raw_profile, 2) # Matches Step 8 filter
+        #smoothed_profile = smooth_profile(raw_profile, 2) # Matches Step 8 filter
+        #trying w/o smoothing, gives pretty much same quality data
+        smoothed_profile = raw_profile
         
         if pixel_quality_map[xi, yi] == 4
             
@@ -1337,10 +1469,150 @@ println("Step 9 Complete! Normalized phase curves map elegantly to a clean templ
 
 
 # ==============================================================================
-#10.  Use the inverse interferometric relationship to transform the normalized intensities into 
-#phase values stepping up by $\pi$ radians per segment.
-# Fig 2.c
+# 10. Phase Inversion & Monotonic Phase Unrolling
 # ==============================================================================
+
+# Structure to hold the full continuous phase curve per pixel 
+# We track the raw voltage steps and their corresponding absolute unrolled phase
+unrolled_phase_data = [
+    Vector{NamedTuple{(:Point, :V, :Phi), Tuple{Int, Float32, Float32}}}()
+    for xi in 1:Nx, yi in 1:Ny
+]
+
+# Storage for the overlay plot data (local phase accrued vs normalized voltage)
+overlay_phase_curves = [Vector{Vector{Float32}}() for xi in 1:Nx, yi in 1:Ny]
+overlay_voltage_curves = [Vector{Vector{Float32}}() for xi in 1:Nx, yi in 1:Ny]
+
+println("Beginning Step 10: Transforming Intensity to Phase Space...")
+
+# Loop over every pixel in the ROI
+for xi in 1:Nx
+    for yi in 1:Ny
+        
+        # Only process high-quality 4π phase stroke pixels
+        if pixel_quality_map[xi, yi] == 4
+            
+            # Retrieve precise parabolic boundaries from Step 8
+            boundaries = [
+                min1_map[xi, yi],
+                max1_map[xi, yi],
+                min2_map[xi, yi],
+                max2_map[xi, yi],
+                min3_map[xi, yi]
+            ]
+            
+            raw_profile = intensity_cube[xi, yi, :]
+            smoothed_profile = smooth_profile(raw_profile, 2)
+            
+            # Phase baseline offsets for each segment to unroll continuously up to 4π
+            phase_baselines = [0.0f0, Float32(π), Float32(2π), Float32(3π)]
+            
+            for s in 1:4
+                start_idx_int = round(Int, boundaries[s])
+                end_idx_int   = round(Int, boundaries[s+1])
+                
+                # Slice segment intensities and setup matching voltage tracking arrays
+                seg_intensities = smoothed_profile[start_idx_int:end_idx_int]
+                seg_voltages    = Float32.( (start_idx_int-1):(end_idx_int-1) )
+                
+                # Normalize X-axis using floating parabolic coordinates
+                v_min = Float32(boundaries[s] - 1)
+                v_max = Float32(boundaries[s+1] - 1)
+                norm_v = (seg_voltages .- v_min) ./ (v_max - v_min)
+                
+                # Normalize Y-axis intensity strictly to [0.0, 1.0]
+                i_min, i_max = extrema(seg_intensities)
+                norm_i = (i_max > i_min) ? (seg_intensities .- i_min) ./ (i_max - i_min) : zeros(Float32, length(seg_intensities))
+                
+                # Apply inverse interferometric equations based on segment direction
+                local_phi = zeros(Float32, length(norm_i))
+                if s == 1 || s == 3
+                    # Rising segments: Min to Max
+                    local_phi .= 2.0f0 .* asin.(sqrt.(norm_i))
+                else
+                    # Falling segments: Max to Min
+                    local_phi .= 2.0f0 .* acos.(sqrt.(norm_i))
+                end
+                
+                # Compute absolute unrolled phase values
+                abs_phi = local_phi .+ phase_baselines[s]
+                
+                # Save data for the local overlay plot
+                push!(overlay_phase_curves[xi, yi], local_phi)
+                push!(overlay_voltage_curves[xi, yi], norm_v)
+                
+                # Stream into global continuous data log for LUT creation
+                for idx in 1:length(seg_voltages)
+                    push!(unrolled_phase_data[xi, yi], (
+                        Point = start_idx_int + idx - 1,
+                        V     = seg_voltages[idx],
+                        Phi   = abs_phi[idx]
+                    ))
+                end
+            end
+        end
+        
+    end
+end
+
+println("Phase inversion complete. Generating diagnostic plots...")
+
+# ==============================================================================
+# Visualization: 2-Panel Diagnostic Figure
+# ==============================================================================
+mid_xi = round(Int, Nx / 2)
+mid_yi = round(Int, Ny / 2)
+actual_slm_x = slm_x_range[mid_xi]
+actual_slm_y = slm_y_range[mid_yi]
+
+fig_phase = Figure(size=(1200, 500))
+
+# Panel A: Segment Overlay (Local Phase vs Normalized Voltage)
+ax_overlay = CM.Axis(
+    fig_phase[1, 1],
+    title = "Normalized Segment Overlay: Phase vs Voltage\nSLM Pixel ($actual_slm_x, $actual_slm_y)",
+    xlabel = "Normalized Voltage Axis (V / V_max)",
+    ylabel = "Local Phase Accrued (Radians)",
+    yticks = (0:π/4:π, ["0", "π/4", "π/2", "3π/4", "π"])
+)
+
+# Panel B: Continuous Unrolled Phase Curve
+ax_unrolled = CM.Axis(
+    fig_phase[1, 2],
+    title = "Continuous Absolute Phase Evolution (4π Stroke)\nSLM Pixel ($actual_slm_x, $actual_slm_y)",
+    xlabel = "Raw Voltage Step (0 - 255)",
+    ylabel = "Absolute Phase (Radians)",
+    yticks = (0:π:4π, ["0", "1π", "2π", "3π", "4π"])
+)
+
+segment_colors = [:deepskyblue, :darkorange, :crimson, :forestgreen]
+segment_labels = ["Seg 1 (0 → π)", "Seg 2 (π → 2π)", "Seg 3 (2π → 3π)", "Seg 4 (3π → 4π)"]
+
+# Populate Panel A: Overlay curves
+for s in 1:4
+    v_curve = overlay_voltage_curves[mid_xi, mid_yi][s]
+    p_curve = overlay_phase_curves[mid_xi, mid_yi][s]
+    
+    lines!(ax_overlay, v_curve, p_curve, color = segment_colors[s], linewidth = 2.5, label = segment_labels[s])
+    scatter!(ax_overlay, v_curve, p_curve, color = segment_colors[s], markersize = 5)
+end
+axislegend(ax_overlay, position = :rb, framevisible = true)
+
+# Populate Panel B: Continuous absolute curve
+target_unrolled = unrolled_phase_data[mid_xi, mid_yi]
+v_raw = [pt.V for pt in target_unrolled]
+phi_abs = [pt.Phi for pt in target_unrolled]
+
+# Sort tracking arrays chronologically by voltage to handle any overlapping slice indices gracefully
+p = sortperm(v_raw)
+v_raw_sorted = v_raw[p]
+phi_abs_sorted = phi_abs[p]
+
+lines!(ax_unrolled, v_raw_sorted, phi_abs_sorted, color = :purple, linewidth = 3)
+scatter!(ax_unrolled, v_raw_sorted, phi_abs_sorted, color = :black, markersize = 4)
+
+display(fig_phase)
+println("Step 10 Diagnostic Figures Rendered!")
 
 
 
@@ -1348,6 +1620,343 @@ println("Step 9 Complete! Normalized phase curves map elegantly to a clean templ
 #11. Invert to create the Look-Up Table
 # Fig 2.d
 # ==============================================================================
+println("Beginning Step 11: Inverting Multi-Tiered Phase Curves into Unified 8-bit Maps...")
+
+# Define our global target phase axis: 256 steps spanning a full 4π cycle
+target_phase_steps = Float32.(range(0.0, stop=4π, length=256))
+
+# Initialize the 3D Regional Matrix (Nx x Ny x 256 Phase Graylevels)
+regional_lut_matrix = zeros(UInt8, Nx, Ny, 256)
+
+count_4pi = 0
+count_2pi = 0
+count_fallback = 0
+
+for xi in 1:Nx
+    for yi in 1:Ny
+        
+        quality = pixel_quality_map[xi, yi]
+        
+        if quality == 4 || quality == 2
+            pixel_data = unrolled_phase_data[xi, yi]
+            
+            # Sort chronologically by absolute tracking phase
+            p = sortperm([pt.Phi for pt in pixel_data])
+            sorted_data = pixel_data[p]
+            
+            v_raw   = [pt.V for pt in sorted_data]
+            phi_abs = [pt.Phi for pt in sorted_data]
+            phi_start = phi_abs[1]
+            
+            for grey in 1:256
+                # Determine the nominal target phase relative to this pixel's start point
+                rel_target = target_phase_steps[grey]
+                
+                # TIERED WRAPPING: If this pixel only supports a 2π stroke, wrap target phase inside the LUT
+                if quality == 2
+                    rel_target = mod(rel_target, 2π)
+                end
+                
+                target_phi = phi_start + rel_target
+                
+                # Local linear interpolation inside the pixel's calibrated phase sweep
+                if target_phi <= phi_abs[1]
+                    target_v_step = v_raw[1]
+                elseif target_phi >= phi_abs[end]
+                    target_v_step = v_raw[end]
+                else
+                    idx = findfirst(p -> p >= target_phi, phi_abs)
+                    idx = (idx === nothing) ? length(phi_abs) : idx
+                    idx_low = max(1, idx - 1)
+                    
+                    d_phi = phi_abs[idx] - phi_abs[idx_low]
+                    weight = (d_phi > 0.0f0) ? (target_phi - phi_abs[idx_low]) / d_phi : 0.0f0
+                    
+                    target_v_step = v_raw[idx_low] + weight * (v_raw[idx] - v_raw[idx_low])
+                end
+                
+                # Save directly as 8-bit unsigned integer voltage steps
+                regional_lut_matrix[xi, yi, grey] = UInt8(clamp(round(Int, target_v_step), 0, 255))
+            end
+            
+            if quality == 4; count_4pi += 1; else; count_2pi += 1; end
+            
+        else
+            # FALLBACK: Assign nominal uncalibrated drive scale assuming 4π response over 0-255
+            for grey in 1:256
+                regional_lut_matrix[xi, yi, grey] = UInt8(grey - 1)
+            end
+            count_fallback += 1
+        end
+        
+    end
+end
+
+datadir = "W:\\Projects\\CU-MINFLUX\\SLM calibration\\"
+mkpath(datadir) 
+timestamp = Dates.format(now(), "yyyy-mm-dd_HH-MM-SS")
+
+save_path = joinpath(
+    datadir,
+    "$(ROISize)x$(ROISize)_center_$(slm_x_range[mid_xi])_$(slm_y_range[mid_yi])_$timestamp.jld2"
+)
+
+
+println("Saving spatial lookup matrix to: $save_path")
+@save save_path regional_lut_matrix slm_x_range slm_y_range pixel_quality_map
+
+println("Step 11 Complete!")
+println(" -> 4π Calibrated Pixels: $count_4pi")
+println(" -> 2π Wrapped Calibrated Pixels: $count_2pi")
+println(" -> Fallback/Nominal Pixels: $count_fallback")
+
+
+
+
+
+# ================================================================================
+function genDiagnosticQuadrantGrid(center_x=514, center_y=561, box_size=480)
+    N = 1024 # Native SLM resolution
+    phaseGrid = zeros(Float32, N, N)
+    
+    # Calculate bounding box bounds
+    half_size = div(box_size, 2)
+    x_start = center_x - half_size + 1
+    x_end   = center_x + half_size
+    y_start = center_y - half_size + 1
+    y_end   = center_y + half_size
+    
+    # Phase values to test different stroke areas of the LUT
+    p1 = 0.0f0          # Top-Left
+    p2 = Float32(π / 2)  # Top-Right
+    p3 = Float32(π)      # Bottom-Left
+    p4 = Float32(3π / 2) # Bottom-Right
+
+    for y in y_start:y_end
+        is_bottom = y > center_y
+        for x in x_start:x_end
+            is_right = x > center_x
+            
+            if !is_bottom && !is_right
+                phaseGrid[x, y] = p1 # Top-Left
+            elseif !is_bottom && is_right
+                phaseGrid[x, y] = p2 # Top-Right
+            elseif is_bottom && !is_right
+                phaseGrid[x, y] = p3 # Bottom-Left
+            else
+                phaseGrid[x, y] = p4 # Bottom-Right
+            end
+        end
+    end
+    
+    return phaseGrid, (x_start:x_end, y_start:y_end)
+end
+
+
+phase_pattern, (x_range, y_range) =
+    genDiagnosticQuadrantGrid(center_x, center_y, 480)
+
+raw_frame = zeros(UInt8, 1024, 1024)
+
+for y in y_range
+    for x in x_range
+
+        p = phase_pattern[x,y]
+
+        raw_frame[y,x] =
+            p ≈ 0      ? UInt8(0)   :
+            p ≈ π/2    ? UInt8(64)  :
+            p ≈ π      ? UInt8(128) :
+                          UInt8(192)
+    end
+end
+
+slm.phase = Float64.(raw_frame) ./ 255
+Meadowlark.writesingleimage(slm)
+
+
+
+diagnostic_phase, (x_range, y_range) =
+    genDiagnosticQuadrantGrid(
+        center_x,
+        center_y,
+        480
+    )
+diagnostic_frame = prepare_hardware_frame(
+    diagnostic_phase,
+    regional_lut_matrix,
+    x_range,
+    y_range;
+)
+
+slm.phase = Float64.(diagnostic_frame) ./ 255.0
+
+status = Meadowlark.writesingleimage(slm)
+
+println("SLM write status = $status")
+
+
+testing_image = try
+    ThorCamCSC.capture(test_cam)
+finally
+    ThorCamCSC.disarmcamera(test_cam)
+end
+
+imshow(Float64.(testing_image)) #
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# Graph a particular phase function og verion
+# ==============================================================================
+
+function prepare_hardware_frame(target_phase_matrix::Matrix{Float32}, regional_lut::Array{UInt8, 3}, slm_x_range, slm_y_range; native_width=1024, native_height=1024)
+    
+    # 1. Allocate full native display frame buffer
+    full_frame = zeros(UInt8, native_width, native_height)
+    
+    # 2. Pre-populate the global frame with baseline nominal linear phase mapping.
+    # This keeps the uncalibrated frame borders safe and predictable.
+    for x in 1:native_width
+        for y in 1:native_height
+            # Wrap nominal phase to 4π to match our global pipeline range
+            wrapped_nominal = mod(target_phase_matrix[x, y], 4π)
+            full_frame[x, y] = UInt8(clamp(round(Int, (wrapped_nominal / 4π) * 255.0), 0, 255))
+        end
+    end
+    
+    # 3. Overlay the high-precision calibrated region
+    Nx, Ny = length(slm_x_range), length(slm_y_range)
+    for xi in 1:Nx
+        for yi in 1:Ny
+            slm_x = slm_x_range[xi]
+            slm_y = slm_y_range[yi]
+            
+            # Universally wrap incoming target phase to the 4π pipeline scale
+            wrapped_phase = mod(target_phase_matrix[slm_x, slm_y], 4π)
+            
+            # Quantize phase value into index 1-256
+            phase_idx = clamp(round(Int, (wrapped_phase / 4π) * 255.0) + 1, 1, 256)
+            
+            # Write out the customized calibrated byte directly
+            full_frame[slm_x, slm_y] = regional_lut[xi, yi, phase_idx]
+        end
+    end
+    
+    return full_frame
+end
+
+
+
+#Did not work...
+# ==============================================================================
+# 1. Function to Generate a Pure Vortex (Donut) Phase Pattern
+# ==============================================================================
+function generate_vortex_target(native_width::Int, native_height::Int, center_x::Real, center_y::Real; charge::Int=1)
+    # Pre-allocate the matrix in radians
+    target_phase = zeros(Float32, native_width, native_height)
+    
+    for x in 1:native_width
+        for y in 1:native_height
+            dx = x - center_x
+            dy = y - center_y
+            
+            if dx == 0 && dy == 0
+                target_phase[x, y] = 0.0f0
+            else
+                # atan2 returns values from -π to +π. 
+                # We add π to shift the range smoothly to [0, 2π].
+                angle = atan(dy, dx) + π
+                
+                # Multiply by the topological charge (standard MINFLUX is charge=1)
+                target_phase[x, y] = Float32(charge * angle)
+            end
+        end
+    end
+    return target_phase
+end
+
+
+# 1. Determine the exact pixel center of your 475x475 calibrated ROI
+mid_xi = div(length(slm_x_range), 2) + 1
+mid_yi = div(length(slm_y_range), 2) + 1
+
+center_x = slm_x_range[mid_xi]
+center_y = slm_y_range[mid_yi]
+
+println("Generating a donut phase pattern centered at SLM pixel: ($center_x, $center_y)")
+
+# 2. Generate the pure target phase profile (1024 x 1024 matrix in radians)
+native_w, native_h = 1024, 1024
+donut_target_phase = generate_vortex_target(native_w, native_h, center_x, center_y, charge=1)
+
+# 3. Process the target phase map through your high-precision multi-tiered regional LUT
+# This function applies your 4π/2π/Nominal calibrations and pads the borders.
+calibrated_hardware_frame = prepare_hardware_frame(
+    donut_target_phase, 
+    regional_lut_matrix, 
+    slm_x_range, 
+    slm_y_range; 
+    native_width=native_w, 
+    native_height=native_h
+)
+
+calibrated_hardware_frame_f64 = Float64.(calibrated_hardware_frame) ./ 255.0
+
+slm.phase = calibrated_hardware_frame_f64
+
+Meadowlark.writesingleimage(slm) # returns 1 for success
+
+
+
+
+uncalibrated_vortex = zeros(UInt8, 1024, 1024)
+for x in 1:1024
+    for y in 1:1024
+        dx = x - center_x
+        dy = y - center_y
+        if dx != 0 || dy != 0
+            angle = atan(dy, dx) + π  # Shunted to [0, 2π]
+            # Map [0, 2π] linearly onto [0, 255] bytes
+            uncalibrated_vortex[x, y] = UInt8(clamp(round(Int, (angle / 2π) * 255.0), 0, 255))
+        end
+    end
+end
+
+# 2. Push directly to the SLM
+slm.phase = Float64.(uncalibrated_vortex) ./ 255.0
+Meadowlark.writesingleimage(slm)
+
+
+
+
+testing_image = try
+    ThorCamCSC.capture(test_cam)
+finally
+    ThorCamCSC.disarmcamera(test_cam)
+end
+
+imshow(Float64.(testing_image)) #
+
+
+
+
+
 
 
 
@@ -1380,8 +1989,8 @@ N = 1024
 bg = 84/255
 fg = 53/255
 r = 12
-cx = 512#514
-cy = 512#561
+cx = 514#514
+cy = 561#561
 #Note to self (512, 512)_SLM maps to (713, 433)_Camera. 
 #and (514, 561)_SLM maps to (720, 540)_Camera aka the center of the camera. 
 #so the scaling factor is $\frac{\sqrt{(720-713)^2 + (540-433)^2}}{\sqrt{(561-512)^2 + (514-512)^2}} \approx 2.19$, 
@@ -1502,7 +2111,7 @@ end
 
 
 
-using Dates # Built-in library for handling time delays
+# Built-in library for handling time delays
 
 function run_voltage_calibration_sweep(slm::MLSLM)
     board_number = 1
