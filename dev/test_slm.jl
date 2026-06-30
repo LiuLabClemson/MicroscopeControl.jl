@@ -13,6 +13,8 @@ CM = CairoMakie
 using Statistics
 using JLD2
 using Dates 
+using LinearAlgebra
+using Printf
 
 
 #Constants
@@ -471,13 +473,11 @@ display(fig)
 
 # ==============================================================================
 #7. Sweep the SLm in 256 steps, and measure the corresponding camera intensity on a 2 by 2 block
-# I have three ideas to do this. Method (A), compute the camera coordiante that corresponds to the slm pixel, 
-# then compute the average intensity of the 2 by 2 grid. The second method, (B), would compute the affine polygon 
-# corresponding to the corners of the SLM pixel. Then only use pixels whose center is in the polygon. 
-# My third method (C) is to use bilinear interpolation with the 4 closest pixels. This would give the intensity at the transformed
+# I have three ideas to do this. ethod (A) is to use bilinear interpolation with the 4 closest pixels. This would give the intensity at the transformed
 # point as opposed to the integral of the intensity over the footprint; however, this should be a good first order approximation
-# that should give a good smooth curve. 
-# I have been assuming SLM coordiantes refer to the center of the given SLM pixel, hopefully that is true...
+# that should give a good smooth curve. Method (B), compute the camera coordiante that corresponds to the slm pixel, 
+# then compute the average intensity of the 2 by 2 grid. The third method, (C), fits a gaussian distribution to 10 spots, and then
+# uses this distribution to weight the camera intensities. This works the best but takes the longest!
 # ==============================================================================
 
 # Define the target calibration region on your SLM (e.g., a 400x400 central patch)
@@ -507,6 +507,9 @@ num_slm_y = length(slm_y_range)
 #set exposure time lower
 #test_cam.exposure_time = Clonglong(20008) # 38.897 ms, emprically determined 
 test_cam.exposure_time = Clonglong(70005)
+
+
+
 
 # -----------------------------
 # Method (A) 
@@ -671,6 +674,465 @@ end
 
 
 
+##USE THIS METHOD
+#########$$$$$$$$$$METHOD C$$$$$$$$$$$$$$$$$$$$$$##############
+# ==============================================================================
+# STAGE 0: Narrow pre-sweep (steps 48–58) to locate the first minimum
+# Purpose: find v_dark cheaply so we can build the dark stack before the
+#          main sweep. Only 11 frames. Exposure + SLM write dominates cost.
+# ==============================================================================
+# In the presweep loop, replace the patch indexing with full ROI indexing:
+presweep_voltages = collect(48:58)          # integer grey values, 11 frames
+n_presweep        = length(presweep_voltages)
+presweep_cube_full = zeros(Float32, num_slm_x, num_slm_y, n_presweep)
+
+for (vi, v) in enumerate(presweep_voltages)
+    slm.phase = fill(v / 255.0, 1024, 1024)
+    Meadowlark.writesingleimage(slm)
+
+    cam_frame = try
+        ThorCamCSC.capture(test_cam)
+    finally
+        ThorCamCSC.disarmcamera(test_cam)
+    end
+    cam_img = Float32.(cam_frame)
+
+    for (xi, xs) in enumerate(slm_x_range)
+        for (yi, ys) in enumerate(slm_y_range)
+            xc = affine_matrix[1,1,1]*xs + affine_matrix[1,2,1]*ys + affine_matrix[1,3,1]
+            yc = affine_matrix[1,1,2]*xs + affine_matrix[1,2,2]*ys + affine_matrix[1,3,2]
+            x0 = floor(Int, xc); y0 = floor(Int, yc)
+            x1 = x0+1;           y1 = y0+1
+            if 1 <= x0 && x1 <= 1440 && 1 <= y0 && y1 <= 1080
+                fx = xc-x0; fy = yc-y0
+                presweep_cube_full[xi, yi, vi] =
+                    (1-fx)*(1-fy)*cam_img[y0,x0] + fx*(1-fy)*cam_img[y0,x1] +
+                    (1-fx)*fy*cam_img[y1,x0]     + fx*fy*cam_img[y1,x1]
+            end
+        end
+    end
+end
+
+# Per-pixel minimum voltage map
+v_dark_map = zeros(Int, num_slm_x, num_slm_y)
+for xi in 1:num_slm_x
+    for yi in 1:num_slm_y
+        min_vi = argmin(presweep_cube_full[xi, yi, :])
+        v_dark_map[xi, yi] = presweep_voltages[min_vi]
+    end
+end
+
+# ==============================================================================
+# STAGE 1: Dark stack at v_dark
+# ==============================================================================
+ 
+ 
+phase_dark = fill(0.208316f0, 1024, 1024)
+
+for xi in 1:num_slm_x
+    for yi in 1:num_slm_y
+        global_x = slm_x_range[xi]
+        global_y = slm_y_range[yi]
+
+        phase_dark[global_x, global_y] = v_dark_map[xi, yi] / 255
+    end
+end
+slm.phase = phase_dark
+Meadowlark.writesingleimage(slm)
+ 
+n_dark_frames = 100
+dark_accumulator = zeros(Float64, 1080, 1440)
+ 
+for k in 1:n_dark_frames
+    img = try
+        ThorCamCSC.capture(test_cam)
+    finally
+        ThorCamCSC.disarmcamera(test_cam)
+    end
+    dark_accumulator .+= Float64.(img)
+end
+ 
+dark_mean = dark_accumulator ./ n_dark_frames
+ 
+@printf("  Dark stack complete. Mean dark level = %.1f ADU\n", mean(dark_mean))
+ 
+ 
+# ==============================================================================
+# STAGE 2: Diffraction test — illuminate 10 best_idx SLM pixels, measure PSF
+# ==============================================================================
+ 
+println("\n=== STAGE 2: Diffraction test — PSF characterisation ===")
+best_idx = sortperm(errors)[1:10]
+ 
+
+# Build test phase: dark everywhere, bright only at the 10 calibration points
+phase_diffraction = copy(phase_dark)
+for idx in best_idx
+    xs = round(Int, slm_points[1,1,idx])
+    ys = round(Int, slm_points[2,1,idx])
+    phase_diffraction[xs, ys] = 84/255
+end
+ 
+slm.phase = phase_diffraction
+Meadowlark.writesingleimage(slm)
+ 
+n_test_frames   = 100
+test_accumulator = zeros(Float64, 1080, 1440)
+ 
+for k in 1:n_test_frames
+    img = try
+        ThorCamCSC.capture(test_cam)
+    finally
+        ThorCamCSC.disarmcamera(test_cam)
+    end
+    test_accumulator .+= Float64.(img)
+end
+ 
+test_mean     = test_accumulator ./ n_test_frames
+spot_img      = max.(test_mean .- dark_mean, 0.0)
+
+imshow(test_mean)
+imshow(spot_img)
+#Note to self, in future might get better results if write/capture one dark then one test 100 times 
+
+@printf("  Spot image: max=%.1f ADU, mean=%.2f ADU\n", maximum(spot_img), mean(spot_img))
+ 
+# ── Predict camera centres from affine ──────────────────────────────────────
+predicted_centers = Tuple{Float64,Float64}[]   # (xc=col, yc=row)
+
+for idx in best_idx
+    xs = slm_points[1,1,idx]
+    ys = slm_points[2,1,idx]
+    xc = affine_matrix[1,1,1]*xs + affine_matrix[1,2,1]*ys + affine_matrix[1,3,1]
+    yc = affine_matrix[1,1,2]*xs + affine_matrix[1,2,2]*ys + affine_matrix[1,3,2]
+    push!(predicted_centers, (xc, yc))
+end
+ 
+# ── Extract centroid-refined ROIs ─────────────────────────────────────────────
+window_big  = 8    # initial extraction window for centroid finding
+window_fit  = 6    # final tight window for Gaussian fitting (±6 px = 13×13)
+ 
+rois_fit         = Matrix{Float64}[]
+true_centers_fit = Tuple{Float64,Float64}[]   # (col, row)
+ 
+for (xc_pred, yc_pred) in predicted_centers
+    pc = round(Int, xc_pred)
+    pr = round(Int, yc_pred)
+ 
+    r0 = clamp(pr - window_big, 1, 1080)
+    r1 = clamp(pr + window_big, 1, 1080)
+    c0 = clamp(pc - window_big, 1, 1440)
+    c1 = clamp(pc + window_big, 1, 1440)
+ 
+    big_roi = spot_img[r0:r1, c0:c1]
+    total   = sum(max.(big_roi, 0.0))
+ 
+    if total < 1.0
+        push!(true_centers_fit, (Float64(pc), Float64(pr)))
+        push!(rois_fit, spot_img[clamp(pr-window_fit,1,1080):clamp(pr+window_fit,1,1080),
+                                  clamp(pc-window_fit,1,1440):clamp(pc+window_fit,1,1440)])
+        continue
+    end
+ 
+    # Intensity-weighted centroid in full-image coordinates
+    wrow = sum((r0:r1) .* vec(sum(max.(big_roi, 0.0), dims=2))) / total
+    wcol = sum((c0:c1) .* vec(sum(max.(big_roi, 0.0), dims=1))) / total
+ 
+    push!(true_centers_fit, (wcol, wrow))
+ 
+    tc_r = round(Int, wrow)
+    tc_c = round(Int, wcol)
+ 
+    rs = clamp(tc_r - window_fit, 1, 1080)
+    re = clamp(tc_r + window_fit, 1, 1080)
+    cs = clamp(tc_c - window_fit, 1, 1440)
+    ce = clamp(tc_c + window_fit, 1, 1440)
+    push!(rois_fit, spot_img[rs:re, cs:ce])
+end
+ 
+# ── 2D Gaussian fit ──────────────────────────────────────────────────────────
+"""
+    fit_2d_gaussian_full(roi)
+ 
+Fit a 2D Gaussian with 6 parameters:
+    I(r,c) = floor + amplitude × exp(-½[(c-μ_c)²/σ_c² + (r-μ_r)²/σ_r²])
+ 
+Parameters returned:
+  μ_col, μ_row   : centre in ROI-local 1-based pixel coordinates
+  σ_col, σ_row   : 1/e² half-widths (pixels)
+  amplitude      : peak above floor (ADU)
+  floor          : constant background level (ADU)
+ 
+Uses intensity-weighted moments (robust, fast, no iterative solve needed).
+"""
+function fit_2d_gaussian_full(roi::Matrix{<:Real})
+    nr, nc = size(roi)
+ 
+    floor_val = minimum(roi)
+    roi_bg    = max.(roi .- floor_val, 0.0)
+    total     = sum(roi_bg)
+ 
+    if total < 1e-9
+        return (μ_col=nc/2.0, μ_row=nr/2.0,
+                σ_col=NaN, σ_row=NaN,
+                amplitude=NaN, floor=floor_val)
+    end
+ 
+    # First moments (centroid)
+    μ_row = sum((1:nr) .* vec(sum(roi_bg, dims=2))) / total
+    μ_col = sum((1:nc) .* vec(sum(roi_bg, dims=1))) / total
+ 
+    # Second moments (variance)
+    σ²_row = 0.0; σ²_col = 0.0
+    for r in 1:nr, c in 1:nc
+        w = roi_bg[r, c]
+        σ²_row += w * (r - μ_row)^2
+        σ²_col += w * (c - μ_col)^2
+    end
+    σ²_row /= total; σ²_col /= total
+ 
+    amplitude = maximum(roi_bg)
+ 
+    return (μ_col     = μ_col,
+            μ_row     = μ_row,
+            σ_col     = sqrt(σ²_col),
+            σ_row     = sqrt(σ²_row),
+            amplitude = amplitude,
+            floor     = floor_val)
+end
+ 
+# Fit all 10 spots
+gaussian_fits = [fit_2d_gaussian_full(roi) for roi in rois_fit]
+ 
+println("\n  6-parameter Gaussian fits:")
+println("  Spot | μ_col  | μ_row  | σ_col | σ_row | FWHM_c | FWHM_r | Amplitude |  Floor")
+for (i, g) in enumerate(gaussian_fits)
+    if isnan(g.σ_col)
+        println("  $i    | FAILED")
+        continue
+    end
+    @printf("  %4d | %6.2f | %6.2f | %5.2f | %5.2f | %6.2f  | %6.2f  | %9.1f | %6.1f\n",
+            i, g.μ_col, g.μ_row, g.σ_col, g.σ_row,
+            2.355*g.σ_col, 2.355*g.σ_row, g.amplitude, g.floor)
+end
+ 
+σ_cols_all = filter(!isnan, [g.σ_col for g in gaussian_fits])
+σ_rows_all = filter(!isnan, [g.σ_row for g in gaussian_fits])
+σ_col_final = median(σ_cols_all)
+σ_row_final = median(σ_rows_all)
+ 
+println("\n  Summary:")
+@printf("  Median σ_col = %.2f px  (FWHM = %.2f px = %.2f µm)\n",
+        σ_col_final, 2.355*σ_col_final, 2.355*σ_col_final*3.45)
+@printf("  Median σ_row = %.2f px  (FWHM = %.2f px = %.2f µm)\n",
+        σ_row_final, 2.355*σ_row_final, 2.355*σ_row_final*3.45)
+ 
+# ── Visualisation: 10 spots with Gaussian overlay ────────────────────────────
+fig_spots = Figure(size=(1400, 600))
+ 
+for (i, (roi, g)) in enumerate(zip(rois_fit, gaussian_fits))
+    row_panel = ceil(Int, i / 5)
+    col_panel = mod1(i, 5)
+    nr, nc    = size(roi)
+ 
+    col_ax = (1:nc) .- g.μ_col    # zero-centred axes for display
+    row_ax = (1:nr) .- g.μ_row
+ 
+    ax = CM.Axis(fig_spots[row_panel, col_panel],
+                  title   = "Spot $i",
+                  xlabel  = "Δcol (px)",
+                  ylabel  = "Δrow (px)",
+                  aspect  = DataAspect())
+ 
+    heatmap!(ax, col_ax, row_ax, roi', colormap=:inferno)
+ 
+    if !isnan(g.σ_col)
+        # Overlay Gaussian contours at 1σ, 2σ, 3σ
+        θ = range(0, 2π, length=200)
+        for nσ in [1.0, 2.0]
+            lines!(ax,
+                   nσ * g.σ_col .* cos.(θ),
+                   nσ * g.σ_row .* sin.(θ),
+                   color     = nσ == 1.0 ? :white : :cyan,
+                   linewidth = 1.5,
+                   linestyle = :dash)
+        end
+ 
+        # Annotate with 4 key parameters
+        text!(ax,
+              minimum(col_ax) + 0.5,
+              minimum(row_ax) + 0.5,
+              text     = @sprintf("σ=(%.1f,%.1f)\nA=%.0f\nf=%.0f",
+                                   g.σ_col, g.σ_row, g.amplitude, g.floor),
+              fontsize  = 9,
+              color     = :white,
+              align     = (:left, :bottom))
+    end
+end
+ 
+display(fig_spots)
+ 
+# ── Full image overlay: predicted (cyan) vs centroid (yellow) ────────────────
+fig_overlay = Figure(size=(900, 700))
+ax_ov = CM.Axis(fig_overlay[1,1],
+                 title     = "Diffraction test overlay",
+                 yreversed = true)
+heatmap!(ax_ov, spot_img', colormap=:inferno)
+scatter!(ax_ov,
+         [p[1] for p in predicted_centers],
+         [p[2] for p in predicted_centers],
+         color=:cyan, markersize=14, label="affine prediction")
+scatter!(ax_ov,
+         [p[1] for p in true_centers_fit],
+         [p[2] for p in true_centers_fit],
+         color=:yellow, marker=:cross, markersize=12,
+         strokewidth=2, label="centroid refined")
+axislegend(ax_ov)
+display(fig_overlay)
+ 
+ 
+# ==============================================================================
+# STAGE 3: Full 256-step Gaussian-weighted sweep — Method C
+# ==============================================================================
+ 
+println("\n=== STAGE 3: Full 256-step Method C sweep ===")
+ 
+kh_col = ceil(Int, 3 * σ_col_final)
+kh_row = ceil(Int, 3 * σ_row_final)
+@printf("  Kernel: σ_col=%.2f, σ_row=%.2f → footprint %d×%d px\n",
+        σ_col_final, σ_row_final, 2*kh_row+1, 2*kh_col+1)
+ 
+# Pre-compute floating-point camera coordinate map (once, outside loop)
+xc_map_C = zeros(Float64, num_slm_x, num_slm_y)
+yc_map_C = zeros(Float64, num_slm_x, num_slm_y)
+for (xi, xs) in enumerate(slm_x_range)
+    for (yi, ys) in enumerate(slm_y_range)
+        xc_map_C[xi, yi] =
+            affine_matrix[1,1,1]*xs + affine_matrix[1,2,1]*ys + affine_matrix[1,3,1]
+        yc_map_C[xi, yi] =
+            affine_matrix[1,1,2]*xs + affine_matrix[1,2,2]*ys + affine_matrix[1,3,2]
+    end
+end
+ 
+"""
+    gaussian_weighted_sample(cam_img, xc, yc, σ_col, σ_row, half_col, half_row)
+ 
+Matched-filter intensity estimate at sub-pixel position (xc=col, yc=row).
+Weights each camera pixel by the Gaussian PSF profile at its distance from
+the true centre. Equivalent to a weighted mean with weights:
+ 
+    w(r,c) = exp(-½ [(c - xc)²/σ_col² + (r - yc)²/σ_row²])
+ 
+This is the maximum-likelihood intensity estimator for a Gaussian PSF
+in the presence of Poisson/Gaussian shot noise.
+"""
+function gaussian_weighted_sample(cam_img::Matrix{Float32},
+                                    xc::Float64, yc::Float64,
+                                    σ_col::Float64, σ_row::Float64,
+                                    half_col::Int, half_row::Int)
+ 
+    cam_rows, cam_cols = size(cam_img)
+ 
+    # Integer centre
+    col0 = round(Int, xc)
+    row0 = round(Int, yc)
+ 
+    # Sub-pixel offset
+    δcol = xc - col0
+    δrow = yc - row0
+ 
+    weighted_sum = 0.0f0
+    weight_total = 0.0f0
+ 
+    for dr in -half_row:half_row
+        r = row0 + dr
+        (r < 1 || r > cam_rows) && continue
+ 
+        for dc in -half_col:half_col
+            c = col0 + dc
+            (c < 1 || c > cam_cols) && continue
+ 
+            # Distance from the true (sub-pixel) centre
+            d_col = (dc - δcol) / σ_col
+            d_row = (dr - δrow) / σ_row
+ 
+            w = exp((-0.5f0) * Float32(d_col^2 + d_row^2))
+ 
+            weighted_sum += w * cam_img[r, c]
+            weight_total += w
+        end
+    end
+ 
+    return weight_total > (1.0f-9) ? weighted_sum / weight_total : (0.0f0)
+end
+ 
+intensity_cube = zeros(Float32, num_slm_x, num_slm_y, 256)
+ 
+t_sweep_start = time()
+ 
+for v in 0:255
+    slm.phase = fill(v / 255.0, 1024, 1024)
+    Meadowlark.writesingleimage(slm)
+ 
+    cam_frame = try
+        ThorCamCSC.capture(test_cam)
+    finally
+        ThorCamCSC.disarmcamera(test_cam)
+    end
+    cam_img = Float32.(cam_frame)
+ 
+    for xi in 1:num_slm_x
+        for yi in 1:num_slm_y
+            intensity_cube[xi, yi, v+1] = gaussian_weighted_sample(
+                cam_img,
+                xc_map_C[xi, yi],
+                yc_map_C[xi, yi],
+                σ_col_final, σ_row_final,
+                kh_col, kh_row)
+        end
+    end
+ 
+    if v % 32 == 0
+        elapsed = round(time() - t_sweep_start, digits=1)
+        @printf("  Sweep: step %3d/255  |  elapsed %.1f s  |  est. remaining %.1f s\n",
+                v, elapsed, elapsed / max(v,1) * (255 - v))
+    end
+end
+ 
+total_time = round(time() - t_sweep_start, digits=1)
+println("\nMethod C sweep complete in $(total_time) s.")
+println("intensity_cube shape: ", size(intensity_cube))
+println("Ready for Step 8 (extrema detection).")
+ 
+# Quick sanity plot — centre pixel curve
+mid_xi = num_slm_x ÷ 2
+mid_yi = num_slm_y ÷ 2
+curve_demo = Float64.(intensity_cube[mid_xi, mid_yi, :])
+ 
+fig_demo = Figure(size=(800, 400))
+ax_demo  = CM.Axis(fig_demo[1,1],
+    title  = "Method C — centre pixel ($(slm_x_range[mid_xi]), $(slm_y_range[mid_yi]))",
+    xlabel = "Voltage step",
+    ylabel = "Gaussian-weighted intensity (ADU)")
+lines!(ax_demo, 0:255, curve_demo, color=:crimson, linewidth=2)
+display(fig_demo)
+#########$$$$$$$$$$METHOD C_CLAUDE $$$$$$$$$$$$$$$$$$$$$$##############
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 #Graph single plot
 # Select an SLM pixel right in the middle of  calibrated Region of Interest
@@ -705,6 +1167,8 @@ println("Diagnostic plot rendered for SLM Pixel ($actual_slm_x, $actual_slm_y)."
 println("Verify that you see a clear oscillating wave with 3 maxima and 2 minima.")
 
 
+
+ 
 
 #Graph several plots
 # Pick a handful of pixel indices spread across your ROI
@@ -983,18 +1447,14 @@ axislegend(ax, position = :rb)
 display(fig)
 
 
-
+#SKIP THIS NOT NECCESSEARY ANY MORE WILL DELETE LATER
 #---------------------------------------------------------------------------
 #More diagonitic figures, dont normallly run this time for diffraction limit
-#not working....
+#n
 # This is for the diffraction test, not working yet. 
-
-
 best_idx = sortperm(errors)[1:10]
 
 nframes = 100
-
-
 
 phase_dark = fill(0.208316, 1024, 1024)
 
@@ -1057,8 +1517,6 @@ end
 
 test_mean ./= nframes
 
-
-
 #capture average dark image
 slm.phase = phase_dark
 Meadowlark.writesingleimage(slm)
@@ -1083,8 +1541,6 @@ end
 
 dark_mean ./= nframes
 
-
-
 #subtract the two
 spot_img_rem = test_mean .- dark_mean
 
@@ -1092,7 +1548,6 @@ spot_img_rem[spot_img_rem .< 0] .= 0
 
 imshow(spot_img_rem')
 imshow(test_mean')
-
 
 #=
 mean1 = mean(dark_stack[1:50])
@@ -1123,6 +1578,9 @@ for idx in best_idx
 end
 
 rois = Matrix{Float64}[]
+
+
+###OLD METHOD
 window = 5
 
 # --- ROI Extraction (CRITICAL FIX HERE) ---
@@ -1218,6 +1676,7 @@ peak_idx = argmax(spot_img_rem)
 println("True peak row (y) and col (x): ", peak_idx)
 
 
+#NEW METHOd
 #claude way to visulize diffraction test
 # ── Improved ROI extraction and centering ─────────────────────────────────
 
@@ -1348,6 +1807,381 @@ scatter!(ax2,
 
 axislegend(ax2)
 display(fig2)
+
+#--------------#---------------#----------------#------------#
+
+# ==============================================================================
+# Part 1: Fit 2D Gaussian to each of the 10 spots and extract σx, σy
+# ==============================================================================
+ 
+"""
+    fit_2d_gaussian(roi)
+ 
+Fit a 2D Gaussian to a small ROI (already background-subtracted).
+Uses least-squares on the log-transformed image (linearizes the Gaussian),
+which is fast and robust for well-formed PSF spots.
+ 
+Returns (σ_col, σ_row, amplitude, offset) where σ_col and σ_row
+are the 1/e² half-widths in column and row directions respectively,
+in units of pixels.
+ 
+Coordinate convention: ROI index [row, col], 1-based.
+"""
+function fit_2d_gaussian(roi::Matrix{<:Real})
+    nr, nc = size(roi)
+    
+    # Centre of the ROI in 1-based pixel coords
+    row_c = (nr + 1) / 2.0
+    col_c = (nc + 1) / 2.0
+    
+    # Use intensity-weighted centroid as a better centre estimate
+    total = sum(max.(roi, 0.0))
+    if total < 1e-9
+        return (σ_col=NaN, σ_row=NaN, amplitude=NaN, offset=NaN,
+                centroid_col=col_c, centroid_row=row_c)
+    end
+    
+    wrow = sum((1:nr) .* sum(max.(roi, 0.0), dims=2)[:]) / total
+    wcol = sum((1:nc) .* sum(max.(roi, 0.0), dims=1)[:]) / total
+    
+    # Compute weighted second moments (= σ²) directly
+    # This is more robust than log-linearisation for noisy data
+    σ²_row = 0.0
+    σ²_col = 0.0
+    for r in 1:nr, c in 1:nc
+        w = max(roi[r, c], 0.0)
+        σ²_row += w * (r - wrow)^2
+        σ²_col += w * (c - wcol)^2
+    end
+    σ²_row /= total
+    σ²_col /= total
+    
+    amplitude = maximum(roi)
+    offset    = minimum(roi)
+    
+    return (σ_col    = sqrt(σ²_col),
+            σ_row    = sqrt(σ²_row),
+            amplitude = amplitude,
+            offset    = offset,
+            centroid_col = wcol,
+            centroid_row = wrow)
+end
+ 
+ 
+# Fit all 10 spots
+println("=== 2D Gaussian fits to the 10 diffraction spots ===")
+println("  Spot | σ_col (px) | σ_row (px) | FWHM_col (px) | FWHM_row (px) | Amplitude")
+ 
+gaussian_fits = []
+σ_cols = Float64[]
+σ_rows = Float64[]
+ 
+for (i, roi) in enumerate(rois_centered)
+    gfit = fit_2d_gaussian(Float64.(roi))
+    push!(gaussian_fits, gfit)
+    
+    if !isnan(gfit.σ_col)
+        push!(σ_cols, gfit.σ_col)
+        push!(σ_rows, gfit.σ_row)
+        fwhm_c = 2.355 * gfit.σ_col
+        fwhm_r = 2.355 * gfit.σ_row
+        println("offset: ", gfit.offset)
+        @printf("  %4d | %9.2f  | %9.2f  | %12.2f  | %12.2f  | %.1f\n",
+                i, gfit.σ_col, gfit.σ_row, fwhm_c, fwhm_r, gfit.amplitude)
+    else
+        println("  $i | FAILED (insufficient signal)")
+    end
+end
+ 
+println("\n--- Summary across all spots ---")
+@printf("  Median σ_col = %.2f px  (FWHM = %.2f px)\n",
+        median(σ_cols), 2.355*median(σ_cols))
+@printf("  Median σ_row = %.2f px  (FWHM = %.2f px)\n",
+        median(σ_rows), 2.355*median(σ_rows))
+@printf("  Std σ_col    = %.2f px  (spot-to-spot variation)\n", std(σ_cols))
+@printf("  Std σ_row    = %.2f px\n", std(σ_rows))
+ 
+pixel_size_um = 3.45   # CS165MU1 pixel pitch in µm
+@printf("\n  In physical units (%.2f µm/px):\n", pixel_size_um)
+@printf("  Median FWHM_col = %.2f µm\n", 2.355*median(σ_cols)*pixel_size_um)
+@printf("  Median FWHM_row = %.2f µm\n", 2.355*median(σ_rows)*pixel_size_um)
+ 
+ 
+# ==============================================================================
+# Part 2: 3D surface visualisation of a representative spot + Gaussian model
+# ==============================================================================
+ 
+# Use the spot with the highest peak signal for the 3D plot
+best_spot_i = argmax([isnan(g.amplitude) ? -Inf : g.amplitude for g in gaussian_fits])
+roi_3d      = Float64.(rois_centered[best_spot_i])
+gfit_3d     = gaussian_fits[best_spot_i]
+nr, nc      = size(roi_3d)
+ 
+fig_3d = Figure(size=(1200, 500))
+ 
+# ── Left: measured PSF as 3D surface ──────────────────────────────────────────
+ax_meas = CM.Axis3(fig_3d[1, 1],
+    title     = "Measured PSF — Spot $best_spot_i",
+    xlabel    = "Column offset (px)",
+    ylabel    = "Row offset (px)",
+    zlabel    = "Intensity (ADU)",
+    azimuth   = π/4,
+    elevation = π/6)
+ 
+col_axis = collect(1:nc) .- gfit_3d.centroid_col
+row_axis = collect(1:nr) .- gfit_3d.centroid_row
+ 
+surface!(ax_meas, col_axis, row_axis, roi_3d',
+         colormap = :inferno)
+ 
+# ── Right: fitted 2D Gaussian model ────────────────────────────────────────────
+ax_model = CM.Axis3(fig_3d[1, 2],
+    title     = "Fitted Gaussian model (σ_col=$(round(gfit_3d.σ_col,digits=2)) px, σ_row=$(round(gfit_3d.σ_row,digits=2)) px)",
+    xlabel    = "Column offset (px)",
+    ylabel    = "Row offset (px)",
+    zlabel    = "Intensity (ADU)",
+    azimuth   = π/4,
+    elevation = π/6)
+ 
+gauss_model = [gfit_3d.amplitude *
+               exp(-0.5 * ((c / gfit_3d.σ_col)^2 + (r / gfit_3d.σ_row)^2))
+               for r in row_axis, c in col_axis]
+ 
+surface!(ax_model, col_axis, row_axis, gauss_model',
+         colormap = :inferno)
+ 
+display(fig_3d)
+ 
+ 
+# ==============================================================================
+# Part 3: σ distribution across the 10 spots
+# ==============================================================================
+ 
+fig_sigma = Figure(size=(700, 350))
+ax_s = CM.Axis(fig_sigma[1, 1],
+    title  = "PSF width distribution across 10 spots",
+    xlabel = "Spot index",
+    ylabel = "σ (px)")
+ 
+scatter!(ax_s, 1:length(σ_cols), σ_cols,
+         color=:dodgerblue, markersize=12, label="σ_col")
+scatter!(ax_s, 1:length(σ_rows), σ_rows,
+         color=:crimson, markersize=12, marker=:diamond, label="σ_row")
+ 
+hlines!(ax_s, [median(σ_cols)], color=:dodgerblue, linestyle=:dash, linewidth=1)
+hlines!(ax_s, [median(σ_rows)], color=:crimson,    linestyle=:dash, linewidth=1)
+ 
+axislegend(ax_s)
+display(fig_sigma)
+ 
+ 
+# ==============================================================================
+# Part 4: Gaussian-weighted intensity sampling (improved Method C)
+#
+# Instead of a flat 2×2 box average (Methods A/B), weight each camera pixel
+# by the Gaussian PSF profile evaluated at its distance from the predicted
+# SLM pixel centre.  This is the matched-filter estimate and gives the
+# maximum-likelihood intensity reading for a Gaussian PSF.
+#
+# The kernel is pre-computed once using the median σ measured above,
+# so it adds negligible runtime overhead vs Method A/B.
+# ==============================================================================
+ 
+# Use median σ across spots as the best single estimate of PSF width
+σ_col_est = median(σ_cols)
+σ_row_est = median(σ_rows)
+ 
+# Half-width of the sampling kernel in pixels.
+# 3σ captures 99.7% of a Gaussian's energy; round up to nearest integer.
+kernel_half_col = ceil(Int, 3 * σ_col_est)
+kernel_half_row = ceil(Int, 3 * σ_row_est)
+ 
+println("\n=== Gaussian-weighted sampling kernel ===")
+@printf("  σ_col = %.2f px  →  kernel half-width col = %d px\n",
+        σ_col_est, kernel_half_col)
+@printf("  σ_row = %.2f px  →  kernel half-width row = %d px\n",
+        σ_row_est, kernel_half_row)
+println("  Kernel footprint: $(2*kernel_half_row+1) × $(2*kernel_half_col+1) pixels")
+ 
+"""
+    gaussian_weighted_sample(cam_img, xc, yc, σ_col, σ_row,
+                              half_col, half_row)
+ 
+Sample the camera image at floating-point position (xc [col], yc [row])
+using a Gaussian-weighted average over the surrounding kernel_half window.
+Returns the weighted mean intensity (a scalar Float32).
+ 
+This replaces the flat 2×2 box used in Methods A and B with a kernel that
+matches the actual PSF shape, giving a more accurate and lower-noise
+estimate of the true intensity at each SLM pixel's conjugate location.
+"""
+function gaussian_weighted_sample(cam_img::Matrix{Float32},
+                                    xc::Float64, yc::Float64,
+                                    σ_col::Float64, σ_row::Float64,
+                                    half_col::Int, half_row::Int)
+ 
+    cam_rows, cam_cols = size(cam_img)
+ 
+    # Integer centre
+    col0 = round(Int, xc)
+    row0 = round(Int, yc)
+ 
+    # Sub-pixel offset
+    δcol = xc - col0
+    δrow = yc - row0
+ 
+    weighted_sum = 0.0f0
+    weight_total = 0.0f0
+ 
+    for dr in -half_row:half_row
+        r = row0 + dr
+        (r < 1 || r > cam_rows) && continue
+ 
+        for dc in -half_col:half_col
+            c = col0 + dc
+            (c < 1 || c > cam_cols) && continue
+ 
+            # Distance from the true (sub-pixel) centre
+            d_col = (dc - δcol) / σ_col
+            d_row = (dr - δrow) / σ_row
+ 
+            w = exp((-0.5f0) * Float32(d_col^2 + d_row^2))
+ 
+            weighted_sum += w * cam_img[r, c]
+            weight_total += w
+        end
+    end
+ 
+    return weight_total > (1.0f-9) ? weighted_sum / weight_total : (0.0f0)
+end
+ 
+ 
+# ==============================================================================
+# Part 5: Re-run the 256-step sweep using Gaussian-weighted sampling (Method C)
+#         Drop-in replacement for the Method A / Method B loops
+# ==============================================================================
+ 
+# Pre-compute floating-point camera coordinates for every SLM pixel (once)
+xc_map_f64 = zeros(Float64, num_slm_x, num_slm_y)
+yc_map_f64 = zeros(Float64, num_slm_x, num_slm_y)
+ 
+for (xi, xs) in enumerate(slm_x_range)
+    for (yi, ys) in enumerate(slm_y_range)
+        xc_map_f64[xi, yi] =
+            affine_matrix[1,1,1]*xs + affine_matrix[1,2,1]*ys + affine_matrix[1,3,1]
+        yc_map_f64[xi, yi] =
+            affine_matrix[1,1,2]*xs + affine_matrix[1,2,2]*ys + affine_matrix[1,3,2]
+    end
+end
+ 
+intensity_cube_C = zeros(Float32, num_slm_x, num_slm_y, 256)
+ 
+println("\nInitializing 256-Step Sweep — Method C (Gaussian-weighted)...")
+ 
+for v in 0:255
+    slm.phase = fill(v / 255.0, 1024, 1024)
+    Meadowlark.writesingleimage(slm)
+ 
+    cam_frame = try
+        ThorCamCSC.capture(test_cam)
+    finally
+        ThorCamCSC.disarmcamera(test_cam)
+    end
+    cam_img = Float32.(cam_frame)
+ 
+    for xi in 1:num_slm_x
+        for yi in 1:num_slm_y
+            intensity_cube_C[xi, yi, v+1] = gaussian_weighted_sample(
+                cam_img,
+                Float64(xc_map_f64[xi, yi]),
+                Float64(yc_map_f64[xi, yi]),
+                σ_col_est, σ_row_est,
+                kernel_half_col, kernel_half_row)
+        end
+    end
+ 
+    v % 32 == 0 && println("  Sweep progress: $v/255")
+end
+ 
+println("Method C sweep complete. Cube shape: ", size(intensity_cube_C))
+ 
+ 
+# ==============================================================================
+# Part 6: Side-by-side comparison of Method A vs Method C on the same pixel
+# ==============================================================================
+ 
+mid_xi = num_slm_x ÷ 2
+mid_yi = num_slm_y ÷ 2
+ 
+curve_A = Float64.(intensity_cube[mid_xi, mid_yi, :])
+curve_C = Float64.(intensity_cube_C[mid_xi, mid_yi, :])
+ 
+# Normalise both to their own maximum for a fair shape comparison
+curve_A_norm = curve_A ./ maximum(curve_A)
+curve_C_norm = curve_C ./ maximum(curve_C)
+ 
+fig_cmp = Figure(size=(1000, 450))
+ax_cmp  = CM.Axis(fig_cmp[1, 1],
+    title  = "Method A (flat 2×2) vs Method C (Gaussian-weighted) — SLM ($(slm_x_range[mid_xi]), $(slm_y_range[mid_yi]))",
+    xlabel = "Voltage Step (0–255)",
+    ylabel = "Normalised Intensity")
+ 
+lines!(ax_cmp, 0:255, curve_A_norm,
+       color=:dodgerblue, linewidth=2, label="Method A — flat 2×2")
+lines!(ax_cmp, 0:255, curve_C_norm,
+       color=:crimson,    linewidth=2, label="Method C — Gaussian-weighted")
+axislegend(ax_cmp, position=:rb)
+display(fig_cmp)
+ 
+# Noise proxy: std of the residual after smoothing (lower = less noise in the curve)
+function curve_noise(y; window=5)
+    n = length(y)
+    smoothed = [mean(y[max(1,i-window÷2):min(n,i+window÷2)]) for i in 1:n]
+    return std(y .- smoothed)
+end
+ 
+noise_A = curve_noise(curve_A_norm)
+noise_C = curve_noise(curve_C_norm)
+@printf("\nNoise proxy (Method A) = %.5f\n", noise_A)
+@printf("Noise proxy (Method C) = %.5f\n", noise_C)
+@printf("Improvement factor     = %.2f×\n", noise_A / noise_C)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1774,26 +2608,6 @@ end
 slm.phase = Float64.(raw_frame) ./ 255
 Meadowlark.writesingleimage(slm)
 
-
-
-diagnostic_phase, (x_range, y_range) =
-    genDiagnosticQuadrantGrid(
-        center_x,
-        center_y,
-        480
-    )
-diagnostic_frame = prepare_hardware_frame(
-    diagnostic_phase,
-    regional_lut_matrix,
-    x_range,
-    y_range;
-)
-
-slm.phase = Float64.(diagnostic_frame) ./ 255.0
-
-status = Meadowlark.writesingleimage(slm)
-
-println("SLM write status = $status")
 
 
 testing_image = try
