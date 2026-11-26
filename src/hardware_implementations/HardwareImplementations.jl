@@ -33,8 +33,14 @@ include("simulated_stage/SimulatedStage.jl")
 include("mcl_stage/MadCityLabs.jl")
 @reexport using .MadCityLabs
 
+include("mcl_nano_z/MCLNanoZ.jl")
+@reexport using .MCLNanoZ
+
 include("pi_N472/PI_N472.jl")
 @reexport using .PI_N472
+
+include("pi_s331/PI_S331.jl")   # reuses the GCS2 bindings from PI_N472 (must come after it)
+@reexport using .PI_S331
 
 include("smaract_stage/MCS2Stage_module.jl")
 @reexport using .MCS2Stage_mod

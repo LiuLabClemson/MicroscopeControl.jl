@@ -34,6 +34,18 @@ function gui(stage::Stage)
 end
 
 function gui1d(stage::Stage)
+    #A 1D stage stores its axis either as x (real_x, targ_x, range_x) or,
+    #for a single-axis Z stage, as z (real_z, targ_z, range_z)
+    ax = hasfield(typeof(stage), :real_x) ? "x" : "z"
+    realfield = Symbol("real_", ax)
+    targfield = Symbol("targ_", ax)
+    rangefield = Symbol("range_", ax)
+    getreal() = getproperty(stage, realfield)
+    gettarg() = getproperty(stage, targfield)
+    settarg!(v) = setproperty!(stage, targfield, v)
+    getrng() = getproperty(stage, rangefield)
+    AX = uppercase(ax)
+
     #First we will create a figure to hold the GUI elements
     stage_gui_fig = Figure(size=(600, 400))  #This is the Stage GUI Figure
 
@@ -46,7 +58,7 @@ function gui1d(stage::Stage)
 
     #Creating observables for the labels of the target, current position, servo and drift correction status
     targetstring = @lift begin
-        #Target string lifted from xtarget and ytarget
+        #Target string lifted from xtarget
         xtargstring = string(round($xtarget, digits=4))
         return "( " * xtargstring * " )"
     end
@@ -55,9 +67,9 @@ function gui1d(stage::Stage)
         return "Current Position: ( " * xposstring * " )"
     end
 
-    #Create the fields for entering the x position
+    #Create the fields for entering the position
     Label(stage_gui_fig[1, 1], "Target Position")
-    targettb = Textbox(stage_gui_fig[1, 2], placeholder="Enter X", width=220)
+    targettb = Textbox(stage_gui_fig[1, 2], placeholder="Enter " * AX, width=220)
 
     #Callback function to change the target position
     on(targettb.stored_string) do target_change
@@ -68,21 +80,21 @@ function gui1d(stage::Stage)
 
         x = parse(Float64, target_change)
 
-        if x < stage.range_x[1] || x > stage.range_x[2]
+        if x < getrng()[1] || x > getrng()[2]
             @error "Target position out of range"
             return
         end
 
-        stage.targ_x = x
+        settarg!(x)
         xtarget[] = x
 
-        move(stage, stage.targ_x)
+        move(stage, gettarg())
     end
 
     Label(stage_gui_fig[1, 3], targetstring)
 
-    #Using range, create arrow buttons for x with adjustable step size
-    Label(stage_gui_fig[2, 1], "X Axis Control")
+    #Using range, create arrow buttons with adjustable step size
+    Label(stage_gui_fig[2, 1], AX * " Axis Control")
     stage_gui_fig[2, 2] = x_arrow_grid = GridLayout(1, 3)
 
     xbuttonlabels = ["<----", "Home", "---->"]
@@ -103,14 +115,14 @@ function gui1d(stage::Stage)
             return
         end
 
-        if stage.targ_x - xstepsize[] < stage.range_x[1]
+        if gettarg() - xstepsize[] < getrng()[1]
             @error "Target position out of range"
             return
         end
 
-        stage.targ_x -= xstepsize[]
-        xtarget[] = stage.targ_x
-        move(stage, stage.targ_x)
+        settarg!(gettarg() - xstepsize[])
+        xtarget[] = gettarg()
+        move(stage, gettarg())
     end
     on(x_arrow_buttons[2].clicks) do return_home_click
         if stage.connectionstatus == false
@@ -119,7 +131,7 @@ function gui1d(stage::Stage)
         end
 
         home(stage)
-        xtarget[], ytarget[] = stage.targ_x, stage.targ_y
+        xtarget[] = gettarg()
     end
 
 
@@ -129,14 +141,14 @@ function gui1d(stage::Stage)
             return
         end
 
-        if stage.targ_x + xstepsize[] > stage.range_x[2]
+        if gettarg() + xstepsize[] > getrng()[2]
             @error "Target position out of range"
             return
         end
 
-        stage.targ_x += xstepsize[]
-        xtarget[] = stage.targ_x
-        move(stage, stage.targ_x)
+        settarg!(gettarg() + xstepsize[])
+        xtarget[] = gettarg()
+        move(stage, gettarg())
     end
 
     #Create a button to query current position, initialize, shutdown, or stop motion 
@@ -153,7 +165,7 @@ function gui1d(stage::Stage)
         end
 
         getposition(stage)
-        xposition[] = stage.real_x
+        xposition[] = getreal()
     end
     on(control_buttons[2].clicks) do stop_motion_click
         if stage.connectionstatus == false
@@ -166,8 +178,8 @@ function gui1d(stage::Stage)
     on(control_buttons[3].clicks) do initialize_click
         initialize(stage)
         getposition(stage)
-        xposition[] = stage.real_x
-        xtarget[] = stage.targ_x
+        xposition[] = getreal()
+        xtarget[] = gettarg()
 
     end
     on(control_buttons[4].clicks) do shutdown_click
