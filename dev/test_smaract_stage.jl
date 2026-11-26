@@ -1,18 +1,18 @@
-# Test script for the SmarAct MCS2 stage (MCS2Stage_mod module).
+# Test script for the SmarAct MCS2 stage (SmarAct_MCS2 module).
 # Run line by line / block by block in the REPL (e.g. Shift+Enter in VS Code).
 #
 # Units:
-#   low-level API  (move!, getposition!, stage.pos_pm, min_pm/max_pm, home_pm)  -> picometres (Int64)
-#   generic API    (move, getposition, real_*/targ_*/range_*), move_um!          -> micrometres (Float64)
+#   low-level helpers (move_all!, getposition_pm, stage.pos_pm, min_pm/max_pm, home_pm) -> picometres (Int64)
+#   StageInterface    (move, getposition, getrange, real_*/targ_*/range_*)             -> micrometres (Float64)
 #
-# NOTE: move_all! (used by move!, move_um!, move, home) waits for completion in an
+# NOTE: move_all! (used by move and home) waits for completion in an
 # @async task, so these calls return BEFORE the motion finishes and the position they
 # print/store is stale. Use `waitmove(stage)` below before reading the position.
 
 using Revise
 using MicroscopeControl
-using MicroscopeControl.HardwareImplementations.MCS2Stage_mod
-const SA = MicroscopeControl.HardwareImplementations.MCS2Stage_mod   # access to non-exported helpers
+using MicroscopeControl.HardwareImplementations.SmarAct_MCS2
+const SA = MicroscopeControl.HardwareImplementations.SmarAct_MCS2   # access to non-exported helpers
 const SI = MicroscopeControl.HardwareInterfaces.StageInterface
 
 # Block until no connected channel is actively moving (or timeout).
@@ -34,7 +34,7 @@ stage = MCS2Stage(
     n_channels  = 3,
     channel_ids = Int32[0, 1, 2],
 )
-initialize(stage)                      # generic entry point: initialize! + sync of real_*/targ_*/range_*/servostatus
+initialize(stage)                      # opens the device, syncs real_*/targ_*/range_*/servostatus
 
 stage.connectionstatus
 stage.n_channels                       # truncated if the controller has fewer channels
@@ -66,9 +66,9 @@ set_acceleration!(stage, Int64(1_000_000_000))   # 1 mm/s²
 stage.velocity_pm_s, stage.accel_pm_s2
 
 ## ---------------------------------------------------------------- read position
-getposition!(stage)                    # Vector{Int64}, pm
-getposition(stage)                     # updates real_x/real_y/real_z (µm)
-stage.real_x, stage.real_y, stage.real_z
+getposition_pm(stage)                  # Vector{Int64}, pm
+getposition(stage)                     # (x, y, z) in µm; also updates real_x/real_y/real_z
+getrange(stage)                        # software range in µm
 
 ## ---------------------------------------------------------------- generic move (µm)
 x0, y0, z0 = stage.real_x, stage.real_y, stage.real_z
@@ -81,16 +81,17 @@ getposition(stage); (stage.real_x, stage.real_y, stage.real_z)
 move(stage, x0, y0); waitmove(stage)   # 2-argument form (gui2d); z unchanged
 getposition(stage); (stage.real_x, stage.real_y, stage.real_z)
 
-## ---------------------------------------------------------------- low-level moves
-move_um!(stage, [x0, y0, z0]); waitmove(stage)                 # µm, one value per channel
-getposition!(stage) ./ 1e6
+move(stage, [x0, y0, z0]); waitmove(stage)                    # vector form, µm, one value per channel
+getposition(stage)
 
-p = getposition!(stage)
-move!(stage, p .+ Int64(5_000_000)); waitmove(stage)          # +5 µm on every channel (pm)
-getposition!(stage) ./ 1e6
+## ---------------------------------------------------------------- low-level moves (pm)
+p = getposition_pm(stage)
+move_all!(stage, p .+ Int64(5_000_000)); waitmove(stage)      # +5 µm on every channel
+getposition_pm(stage) ./ 1e6
 
-SA.move_abs!(stage, 1, p[1])                                  # single channel, blocking (pm)
-getposition!(stage) ./ 1e6
+SA.move_abs!(stage, 1, p[1])                                  # single channel, blocking
+getposition_pm(stage) ./ 1e6
+getposition(stage)                                            # re-sync real_*/µm fields after pm moves
 
 ## ---------------------------------------------------------------- step scan: commanded vs. measured (channel 1)
 targets = x0 .+ collect(-50.0:10.0:50.0)                      # µm
@@ -110,7 +111,7 @@ move(stage, x0, y0, z0); waitmove(stage)
 set_velocity!(stage, Int64(100_000_000))                      # slow down to 0.1 mm/s so there is time to stop
 move(stage, x0 + 500.0, y0, z0)                               # returns immediately
 sleep(0.5)
-stopmotion(stage)                                             # generic; same as stopmotion!(stage) / stop_all!(stage)
+stopmotion(stage)                                             # same as stop_all!(stage)
 getposition(stage); stage.real_x                              # should be between x0 and x0 + 500
 stop_channel!(stage, 1)
 set_velocity!(stage, Int64(1_000_000_000))

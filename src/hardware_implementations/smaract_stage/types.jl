@@ -35,7 +35,7 @@ end
     MCS2Stage(; kwargs...) -> MCS2Stage
 
 Keyword-argument constructor with safe defaults for a 3-channel MCS2.
-All positions default to 0; call `initialize!(stage)` to populate them
+All positions default to 0; call `initialize(stage)` to populate them
 from the device.
 """
 function MCS2Stage(;

@@ -42,8 +42,8 @@ include("pi_N472/PI_N472.jl")
 include("pi_s331/PI_S331.jl")   # reuses the GCS2 bindings from PI_N472 (must come after it)
 @reexport using .PI_S331
 
-include("smaract_stage/MCS2Stage_module.jl")
-@reexport using .MCS2Stage_mod
+include("smaract_stage/SmarAct_MCS2.jl")
+@reexport using .SmarAct_MCS2
 
 # DAQ implementation (must come before modules that depend on it)
 include("nidaq/NIDAQcard.jl")

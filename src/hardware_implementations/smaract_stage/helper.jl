@@ -1,3 +1,10 @@
+#=
+Low-level helpers for the SmarAct MCS2. Everything here works in the
+controller's native unit, picometres (Int64). The StageInterface methods in
+interface_methods.jl convert to/from micrometres.
+=#
+
+const PM_PER_UM = 1e6
 
 function _check!(errcode::SA_CTL_Result_t; msg::String = "Operation failed")
     if errcode != SA_CTL_ERROR_NONE
@@ -39,6 +46,25 @@ function query_positions!(stage::MCS2Stage)
         stage.pos_pm[i] = _get_i64(stage, ch, SA_CTL_PKEY_POSITION)
     end
     @info "Positions (µm): $(round.(stage.pos_pm ./ 1e6, digits=3))"
+end
+
+"""
+    getposition_pm(stage) -> Vector{Int64}
+
+Queries the current position of all channels, updates `stage.pos_pm`,
+and returns the values in picometres.
+"""
+function getposition_pm(stage::MCS2Stage)
+    query_positions!(stage)
+    return copy(stage.pos_pm)
+end
+
+# Mirror pos_pm (pm) into the generic real_x/real_y/real_z fields (µm)
+function _sync_real_um!(stage::MCS2Stage)
+    stage.real_x = stage.pos_pm[1] / PM_PER_UM
+    stage.n_channels >= 2 && (stage.real_y = stage.pos_pm[2] / PM_PER_UM)
+    stage.n_channels >= 3 && (stage.real_z = stage.pos_pm[3] / PM_PER_UM)
+    return nothing
 end
 
 # Query and cache channel state flags
@@ -294,4 +320,157 @@ function _drive_to_endstop!(stage::MCS2Stage, ch::Int32, target_pm::Int64, timeo
     end
  
     SA_CTL_Stop(stage.dHandle[], ch, Int32(0))
+end
+
+# Device connection
+
+"""
+    open_device!(stage) -> Bool
+
+Discovers the first available MCS2 device, opens it, configures all
+connected channels (CLF, hold time, velocity, acceleration), and reads the
+software travel limits into `min_pm`/`max_pm`. Returns `true` on success.
+"""
+function open_device!(stage::MCS2Stage)
+    # Find devices
+    bufsize = 1024
+    device_buf = Vector{Cchar}(undef, bufsize)
+    device_len = Ref{Csize_t}(bufsize)
+
+    result = SA_CTL_FindDevices("", device_buf, device_len)
+    if result != SA_CTL_ERROR_NONE
+        @error "SA_CTL_FindDevices failed: $(unsafe_string(SA_CTL_GetResultInfo(result)))"
+        return false
+    end
+
+    locator = unsafe_string(pointer(device_buf))
+    if isempty(locator)
+        @error "No SmarAct MCS2 devices found.  Check USB/Ethernet connection."
+        return false
+    end
+    @info "Device found: $locator"
+
+    # Open device
+    result = SA_CTL_Open(stage.dHandle, locator, C_NULL)
+    if result != SA_CTL_ERROR_NONE
+        @error "SA_CTL_Open failed: $(unsafe_string(SA_CTL_GetResultInfo(result)))"
+        return false
+    end
+    stage.connectionstatus = true
+    @info "Device opened.  Handle: $(stage.dHandle[])"
+
+    # Read actual channel count and trim struct if needed
+    n_ch_ref = Ref{Int32}()
+    SA_CTL_GetProperty_i32(stage.dHandle[], Int32(0),
+                           SA_CTL_PKEY_NUMBER_OF_CHANNELS, n_ch_ref, Ref{Csize_t}(1))
+    hw_channels = Int(n_ch_ref[])
+    if hw_channels < stage.n_channels
+        @warn "Device has $hw_channels channels; stage configured for $(stage.n_channels). Truncating."
+        stage.n_channels = hw_channels
+        for v in (stage.channel_ids, stage.servostatus, stage.pos_pm, stage.min_pm, stage.max_pm,
+                  stage.home_pm, stage.velocity_pm_s, stage.accel_pm_s2,
+                  stage.is_calibrated, stage.is_referenced, stage.connected)
+            resize!(v, hw_channels)
+        end
+    end
+
+    # Per-channel setup
+    for (i, ch) in enumerate(stage.channel_ids)
+        # Detect whether a positioner is physically attached
+        ch_state = Ref{Int32}()
+        state_result = SA_CTL_GetProperty_i32(stage.dHandle[], ch,
+                               SA_CTL_PKEY_CHANNEL_STATE, ch_state, Ref{Csize_t}(1))
+        if state_result != SA_CTL_ERROR_NONE
+            @warn "Channel $ch: could not read CHANNEL_STATE ($(unsafe_string(SA_CTL_GetResultInfo(state_result)))) — marking as not connected."
+            stage.connected[i] = false
+            continue
+        end
+        sensor_present = (ch_state[] & SA_CTL_CH_STATE_BIT_SENSOR_PRESENT) != 0
+        stage.connected[i] = sensor_present
+
+        if !sensor_present
+            @info "Channel $ch: no positioner detected — skipping motion setup. (Shown as N/C in GUI.)"
+            continue
+        end
+
+        # Amplifier-side settings (safe to set; channel is connected)
+        try
+            SA_CTL_SetProperty_i32(stage.dHandle[], ch,
+                                   SA_CTL_PKEY_MAX_CL_FREQUENCY, Int32(18500))
+            SA_CTL_SetProperty_i32(stage.dHandle[], ch,
+                                   SA_CTL_PKEY_HOLD_TIME, SA_CTL_HOLD_TIME_INFINITE)
+            SA_CTL_SetProperty_i64(stage.dHandle[], ch,
+                                   SA_CTL_PKEY_MOVE_VELOCITY,     stage.velocity_pm_s[i])
+            SA_CTL_SetProperty_i64(stage.dHandle[], ch,
+                                   SA_CTL_PKEY_MOVE_ACCELERATION, stage.accel_pm_s2[i])
+        catch e
+            @warn "Channel $ch: failed to set motion parameters ($e). Marking as not connected."
+            stage.connected[i] = false
+            continue
+        end
+
+        # Travel limits (sensor-dependent; only read if sensor present)
+        lim_min = Ref{Int64}()
+        lim_max = Ref{Int64}()
+        r1 = SA_CTL_GetProperty_i64(stage.dHandle[], ch,
+                               SA_CTL_PKEY_RANGE_LIMIT_MIN, lim_min, Ref{Csize_t}(1))
+        r2 = SA_CTL_GetProperty_i64(stage.dHandle[], ch,
+                               SA_CTL_PKEY_RANGE_LIMIT_MAX, lim_max, Ref{Csize_t}(1))
+        if r1 == SA_CTL_ERROR_NONE && r2 == SA_CTL_ERROR_NONE
+            stage.min_pm[i] = lim_min[]
+            stage.max_pm[i] = lim_max[]
+        else
+            @warn "Channel $ch: could not read travel range — leaving default limits."
+        end
+    end
+
+    # Query initial positions and state
+    query_positions!(stage)
+    query_channel_states!(stage)
+    return true
+end
+
+# Shared implementations behind the StageInterface methods
+
+"""
+    _apply_move!(stage, targets_um)
+
+`targets_um[i]` corresponds to `stage.channel_ids[i]`, in micrometres.
+Channels with no positioner attached keep their current position. Returns
+before the motion finishes (see `move_all!`), so moves can be stopped.
+"""
+function _apply_move!(stage::MCS2Stage, targets_um::AbstractVector{<:Real})
+    targets_pm = copy(stage.pos_pm)
+    for i in eachindex(targets_um)
+        i <= stage.n_channels || break
+        stage.connected[i] || continue   # skip channels with no positioner
+        targets_pm[i] = round(Int64, targets_um[i] * PM_PER_UM)
+    end
+
+    move_all!(stage, targets_pm)
+
+    targ = (:targ_x, :targ_y, :targ_z)
+    for i in 1:min(length(targets_um), stage.n_channels, 3)
+        stage.connected[i] && setproperty!(stage, targ[i], Float64(targets_um[i]))
+    end
+    _sync_real_um!(stage)
+end
+
+"""
+    _apply_servo!(stage, toggles)
+
+`toggles[i]` corresponds to `stage.channel_ids[i]`. Channels with no
+positioner attached are skipped.
+"""
+function _apply_servo!(stage::MCS2Stage, toggles::Vector{Bool})
+    for i in eachindex(toggles)
+        i <= stage.n_channels || break
+        stage.connected[i] || continue   # skip channels with no positioner
+
+        ch = stage.channel_ids[i]
+        _set_i32(stage, ch, SA_CTL_PKEY_CONTROL_LOOP_INPUT,
+                 toggles[i] ? Int32(SA_CTL_CONTROL_LOOP_INPUT_SENSOR) : Int32(SA_CTL_CONTROL_LOOP_INPUT_DISABLED))
+
+        stage.servostatus[i] = toggles[i]
+    end
 end

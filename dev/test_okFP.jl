@@ -1,6 +1,6 @@
     
-include("constants_okFP.jl")
-include("functions_okFP.jl")
+#include("constants_okFP.jl")
+#include("functions_okFP.jl")
 
 const okFP = "C:\\Program Files\\Opal Kelly\\FrontPanelUSB\\API\\lib\\x64\\okFrontPanel.dll"
 
